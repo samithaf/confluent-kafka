@@ -1,0 +1,30 @@
+{
+  "name": "confluent-kafka-cloud-run",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reference architecture and TypeScript examples for Confluent Cloud with Google Cloud Run (PSC, multi-region)",
+  "license": "MIT",
+  "main": "dist/producer-service.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start:producer": "node dist/producer-service.js",
+    "start:consumer": "node dist/consumer-worker.js",
+    "dev:producer": "tsx src/producer-service.ts",
+    "dev:consumer": "tsx src/consumer-worker.ts",
+    "create-topics": "node dist/create-topics.js",
+    "check-connectivity": "node dist/check-connectivity.js"
+  },
+  "dependencies": {
+    "@confluentinc/kafka-javascript": "^1.11.0",
+    "dotenv": "^16.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
