@@ -10,6 +10,8 @@
 
 The recommended default is one cluster per region with Cluster Linking and an active-passive failover plan. Add active-active only when the business requirements justify the consistency and deduplication complexity.
 
+For the HTTP routing layer, concrete global load balancer names, and the Cloud Run service health pattern, see [Regional failover and global routing](failover-routing.md).
+
 ## Cluster Linking
 
 Cluster Linking replicates topics from a source cluster to a destination cluster.

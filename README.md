@@ -61,6 +61,7 @@ docs/
   subscribing.md
   cloud-run.md
   multi-region.md
+  failover-routing.md
   operations.md
 ```
 
@@ -182,6 +183,7 @@ Worker pools do not receive HTTP traffic. Scale them with min/max instances, or 
 - [Subscribing](docs/subscribing.md)
 - [Cloud Run lifecycle and scaling](docs/cloud-run.md)
 - [Multi-region and failover](docs/multi-region.md)
+- [Regional failover and global routing](docs/failover-routing.md)
 - [Operations and security](docs/operations.md)
 
 ## License

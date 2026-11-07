@@ -10,7 +10,7 @@
 | Scale on CPU/requests | Yes | No request signal | No |
 | Scale on Kafka lag | Not native | Via CREMA/KEDA | Not applicable |
 | Billing | Request-based or instance-based | Instance-based | Per execution |
-| Probes | Startup and liveness | Not applicable | Not applicable |
+| Probes | Startup, liveness, and readiness | Not applicable | Not applicable |
 
 Use a service for the producer API. Use a worker pool for consumers. Use a job for topic creation and connectivity checks.
 
@@ -35,7 +35,7 @@ The reference producer exposes:
 - `GET /healthz`: process is up and the producer has connected.
 - `GET /readyz`: same signal for external load balancers.
 
-Cloud Run uses the startup probe to gate traffic. It does not have a separate readiness probe. Do not use Kafka broker availability as a liveness signal: a broker outage should not restart every producer instance.
+Cloud Run uses the startup probe to gate initial traffic and supports readiness probes for routing and cross-region failover. Do not use Kafka broker availability as a liveness signal: a broker outage should not restart every producer instance. Use readiness for routing decisions, and see [Regional failover and global routing](failover-routing.md) for the multi-region load balancer pattern.
 
 Example startup probe:
 
