@@ -20,11 +20,11 @@ A Cloud Run service with request-based billing throttles CPU outside request pro
 
 Options:
 
-- Set `--min-instances=1` to keep a warm instance.
+- Set `--min-instances=2` in each active region for resilience-first operation.
 - Use `--no-cpu-throttling` (instance-based billing) if the service must do meaningful work outside requests.
 - For consumer worker pools, CPU is allocated to the instance for its lifetime. There is no request-based billing.
 
-Cost is driven by allocated CPU and memory, minimum instances, and time. A warm `min-instances=1` instance costs money even with no traffic. Use it deliberately for latency-sensitive producers.
+Cost is driven by allocated CPU and memory, minimum instances, and time. Warm minimum instances cost money even with no traffic. Resilience-first deployments deliberately keep at least two warm instances in each active region, so size the budget for warm capacity rather than scale-to-zero.
 
 ## Probes
 
@@ -32,15 +32,23 @@ Direct VPC egress can delay the first outbound packet while the instance network
 
 The reference producer exposes:
 
-- `GET /healthz`: process is up and the producer has connected.
-- `GET /readyz`: same signal for external load balancers.
+- `GET /healthz`: process is up and the producer has made its initial connection.
+- `GET /readyz`: readiness signal for the regional external ALB and Cloudflare Load Balancing.
 
-Cloud Run uses the startup probe to gate initial traffic and supports readiness probes for routing and cross-region failover. Do not use Kafka broker availability as a liveness signal: a broker outage should not restart every producer instance. Use readiness for routing decisions, and see [Regional failover and global routing](failover-routing.md) for the multi-region load balancer pattern.
+Cloud Run uses the startup probe to gate initial traffic and supports readiness probes for routing and cross-region failover. Do not use Kafka broker availability as a liveness signal: a broker outage should not restart every producer instance. Use readiness for routing decisions.
+
+Cloudflare cannot read Cloud Run service health or serverless NEG health. It only sees the HTTP response from the origin. The sample `/readyz` reflects the initial connection; production deployments should add a bounded Kafka metadata check so a Kafka-only regional failure makes `/readyz` fail. See [Regional failover and Cloudflare edge routing](failover-routing.md).
 
 Example startup probe:
 
 ```bash
 --startup-probe httpGet.path=/healthz,initialDelaySeconds=10,failureThreshold=30,periodSeconds=5,timeoutSeconds=3
+```
+
+Example readiness probe for the regional ALB and Cloudflare health check:
+
+```bash
+--readiness-probe httpGet.path=/readyz,httpGet.port=8080,successThreshold=2,failureThreshold=3,timeoutSeconds=2,periodSeconds=10
 ```
 
 This allows up to roughly 160 seconds for Direct VPC egress, DNS, and the initial Kafka connection. Tune it to your environment.
@@ -87,20 +95,22 @@ gcloud run deploy SERVICE \
   --vpc-egress=private-ranges-only
 ```
 
-The subnet must be in the same region as the Cloud Run resource. The PSC endpoint can be in the same region, or in another region with PSC Global Access.
+The subnet must be in the same region as the Cloud Run resource. Keep the PSC endpoint local to the region for steady-state traffic. PSC Global Access is a fallback for cross-region access while the endpoint region is healthy; it does not make a failed endpoint region available.
 
 If private DNS or cross-region routing does not work with `private-ranges-only`, test `all-traffic` before changing the architecture. `all-traffic` sends all egress through the VPC and may affect other dependencies.
 
 ## Deploying the producer service
 
 ```bash
-gcloud run deploy producer-service \
+gcloud run deploy kafka-producer-api \
   --image us-central1-docker.pkg.dev/PROJECT_ID/REPO/kafka-app:latest \
   --region us-central1 \
   --network kafka-vpc \
   --subnet kafka-run-us-central1 \
   --vpc-egress private-ranges-only \
-  --min-instances 1 \
+  --allow-unauthenticated \
+  --ingress internal-and-cloud-load-balancing \
+  --min-instances 2 \
   --max-instances 50 \
   --cpu 1 \
   --memory 512Mi \
@@ -108,22 +118,27 @@ gcloud run deploy producer-service \
   --timeout 30 \
   --no-cpu-throttling \
   --startup-probe httpGet.path=/healthz,initialDelaySeconds=10,failureThreshold=30,periodSeconds=5,timeoutSeconds=3 \
+  --readiness-probe httpGet.path=/readyz,httpGet.port=8080,successThreshold=2,failureThreshold=3,timeoutSeconds=2,periodSeconds=10 \
   --set-env-vars KAFKA_BOOTSTRAP_SERVERS=pkc-xxxxx.us-central1.gcp.confluent.cloud:9092,KAFKA_TOPIC=orders.v1 \
   --set-secrets KAFKA_API_KEY=kafka-api-key:latest,KAFKA_API_SECRET=kafka-api-secret:latest
 ```
+
+The producer is not exposed directly. Put it behind a regional external ALB and a serverless NEG, then put Cloudflare Load Balancing in front of the regional ALBs. See [Regional failover and Cloudflare edge routing](failover-routing.md).
+
+The service allows unauthenticated requests only because ingress is restricted to the regional ALB and Cloudflare is the public edge. Do not expose the default Cloud Run URL.
 
 Tune `--concurrency` against producer throughput and memory. A single producer instance multiplexes many requests, but the producer queue and event loop still have limits.
 
 ## Deploying the consumer worker pool
 
 ```bash
-gcloud run worker-pools deploy consumer-worker \
+gcloud run worker-pools deploy kafka-consumer-worker \
   --image us-central1-docker.pkg.dev/PROJECT_ID/REPO/kafka-app:latest \
   --region us-central1 \
   --network kafka-vpc \
   --subnet kafka-run-us-central1 \
   --vpc-egress private-ranges-only \
-  --min-instances 1 \
+  --min-instances 2 \
   --max-instances 20 \
   --cpu 1 \
   --memory 512Mi \
@@ -202,6 +217,8 @@ The reference logger emits one JSON object per line with severity, message, serv
 Track:
 
 - Cloud Run request count, latency, and 5xx rate for the producer.
+- Cloudflare origin pool health, health-check status, and origin 5xx rate.
+- Regional external ALB request count, latency, and 5xx rate.
 - Instance count and startup latency.
 - Consumer lag per topic and partition.
 - Rebalance count and commit failures.
@@ -209,16 +226,17 @@ Track:
 - PSC endpoint health and throughput.
 - DNS resolution failures.
 
-Use Cloud Monitoring dashboards and alerts. Add OpenTelemetry tracing at the HTTP boundary and propagate `traceparent` in Kafka headers if you need end-to-end traces.
+Use Cloud Monitoring dashboards and alerts. Cloudflare analytics covers the edge layer. Add OpenTelemetry tracing at the HTTP boundary and propagate `traceparent` in Kafka headers if you need end-to-end traces.
 
 ## Cost notes
 
-- Minimum instances are the main fixed cost.
+- Minimum instances are the main fixed cost. Resilience-first operation keeps at least two warm instances in each active region.
 - Cross-region Global Access traffic adds egress cost and latency.
 - Long-lived consumer instances cost for their lifetime.
 - Compression reduces storage and network cost but increases CPU.
 - Over-provisioning consumers beyond the partition count adds cost with no throughput gain.
-- Keep the PSC and Cloud Run subnets sized correctly; IP exhaustion causes deployment failures.
+- Keep the PSC, Cloud Run, and proxy-only subnets sized correctly; IP exhaustion causes deployment failures.
+- Resilience-first deliberately trades cost for availability. Do not use scale-to-zero or cold standby for the producer if you need automatic edge failover.
 
 ## References
 
@@ -226,3 +244,5 @@ Use Cloud Monitoring dashboards and alerts. Add OpenTelemetry tracing at the HTT
 - [Cloud Run worker pools](https://cloud.google.com/run/docs/configuring/workerpools)
 - [Cloud Run health checks](https://cloud.google.com/run/docs/configuring/healthchecks)
 - [Cloud Run Direct VPC egress](https://cloud.google.com/run/docs/configuring/private-networking)
+- [Cloudflare Load Balancing](https://developers.cloudflare.com/load-balancing/)
+- [Regional external Application Load Balancer with Cloud Run](https://docs.cloud.google.com/load-balancing/docs/https/setting-up-reg-ext-https-serverless)

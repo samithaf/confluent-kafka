@@ -5,26 +5,32 @@ Reference architecture, production notes, and TypeScript examples for running Ka
 This repository focuses on the parts that are easy to get wrong:
 
 - Private networking between Cloud Run and Confluent Cloud using Private Service Connect (PSC), PSC Global Access, and private Cloud DNS.
-- Multi-region Confluent clusters with Cluster Linking, active-passive failover, and active-active topologies.
+- Cloudflare edge routing with WAF, DDoS protection, and Load Balancing in front of regional external Application Load Balancers and Cloud Run serverless NEGs.
+- Multi-region Confluent clusters with Cluster Linking, wired for active-active where the domain allows and warm active-passive otherwise.
 - Correct producer and consumer configuration for `@confluentinc/kafka-javascript` (librdkafka).
-- Cloud Run lifecycle behavior: startup probes, Direct VPC egress startup delay, SIGTERM draining, `min-instances`, and worker pools.
+- Cloud Run lifecycle behavior: startup probes, readiness probes, Direct VPC egress startup delay, SIGTERM draining, `min-instances`, and worker pools.
 - Consumer scaling and offset management without duplicate processing surprises.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
+  CF["Cloudflare<br/>WAF / DDoS / Load Balancing"]
+
   subgraph GCP["GCP region: us-central1"]
-    SVC["Cloud Run service<br/>producer API"]
-    WK["Cloud Run worker pool<br/>consumer"]
+    ALB["Regional external ALB<br/>kafka-producer-lb-us-central1"]
+    SVC["Cloud Run service<br/>kafka-producer-api"]
+    WK["Cloud Run worker pool<br/>kafka-consumer-worker"]
     DNS["Private Cloud DNS<br/>override for us-central1.gcp.confluent.cloud"]
-    PSC["PSC endpoint<br/>10.10.0.10"]
+    PSC["PSC endpoints<br/>3 zones"]
   end
 
   subgraph CC["Confluent Cloud: us-central1"]
     K["Kafka cluster"]
   end
 
+  CF -->|HTTPS origin pool| ALB
+  ALB -->|serverless NEG| SVC
   SVC -->|Direct VPC egress| PSC
   WK -->|Direct VPC egress| PSC
   DNS -.->|A records| PSC
@@ -33,9 +39,11 @@ flowchart LR
 
 The same pattern is repeated per region:
 
+- Cloudflare Load Balancing with one origin pool per region and health checks against `/readyz`.
+- One regional external Application Load Balancer and one serverless NEG per region.
 - One Confluent cluster per region.
 - One PSC service attachment per Confluent cluster and availability zone (`/26` subnet, three endpoints for three zones).
-- PSC Global Access enabled on each endpoint so Cloud Run in another region can reach it.
+- PSC Global Access enabled on each endpoint as a fallback for cross-region access.
 - Direct VPC egress on the Cloud Run service or worker pool.
 - A private Cloud DNS zone with one A record per PSC endpoint.
 - Cluster Linking between regional clusters; producers and consumers always use the local cluster.
@@ -91,7 +99,7 @@ curl -sS -X POST http://localhost:8080/publish \
 
 The producer exposes:
 
-- `GET /healthz` and `GET /readyz` for Cloud Run startup and liveness probes.
+- `GET /healthz` and `GET /readyz` for Cloud Run startup/readiness probes and Cloudflare Load Balancing health checks. `/readyz` must include a bounded Kafka check before it is used as the sole failover signal.
 - `POST /publish` with a JSON body of `{ "key": "...", "value": {...}, "headers": {...} }`.
 
 The consumer uses manual offset commits, batch processing, and rebalance-aware commits.
@@ -105,34 +113,40 @@ gcloud builds submit \
   --tag us-central1-docker.pkg.dev/PROJECT_ID/REPO/kafka-app:latest
 ```
 
-Deploy the producer as a Cloud Run service:
+Deploy the producer as a Cloud Run service behind a regional external ALB and Cloudflare:
 
 ```bash
-gcloud run deploy producer-service \
+gcloud run deploy kafka-producer-api \
   --image us-central1-docker.pkg.dev/PROJECT_ID/REPO/kafka-app:latest \
   --region us-central1 \
   --network kafka-vpc \
-  --subnet kafka-psc \
+  --subnet kafka-run-us-central1 \
   --vpc-egress private-ranges-only \
-  --min-instances 1 \
+  --allow-unauthenticated \
+  --ingress internal-and-cloud-load-balancing \
+  --min-instances 2 \
   --max-instances 50 \
   --cpu 1 \
   --memory 512Mi \
   --timeout 30 \
+  --no-cpu-throttling \
+  --readiness-probe httpGet.path=/readyz,httpGet.port=8080,successThreshold=2,failureThreshold=3,timeoutSeconds=2,periodSeconds=10 \
   --set-env-vars KAFKA_BOOTSTRAP_SERVERS=pkc-xxxxx.us-central1.gcp.confluent.cloud:9092,KAFKA_TOPIC=orders.v1 \
   --set-secrets KAFKA_API_KEY=kafka-api-key:latest,KAFKA_API_SECRET=kafka-api-secret:latest
 ```
 
+The service allows unauthenticated requests only because ingress is restricted to the regional ALB and Cloudflare is the public edge. Do not expose the default Cloud Run URL.
+
 Deploy the consumer as a Cloud Run worker pool:
 
 ```bash
-gcloud run worker-pools deploy consumer-worker \
+gcloud run worker-pools deploy kafka-consumer-worker \
   --image us-central1-docker.pkg.dev/PROJECT_ID/REPO/kafka-app:latest \
   --region us-central1 \
   --network kafka-vpc \
-  --subnet kafka-psc \
+  --subnet kafka-run-us-central1 \
   --vpc-egress private-ranges-only \
-  --min-instances 1 \
+  --min-instances 2 \
   --max-instances 20 \
   --cpu 1 \
   --memory 512Mi \
@@ -142,7 +156,7 @@ gcloud run worker-pools deploy consumer-worker \
   --set-secrets KAFKA_API_KEY=kafka-api-key:latest,KAFKA_API_SECRET=kafka-api-secret:latest
 ```
 
-Worker pools do not receive HTTP traffic. Scale them with min/max instances, or use CREMA or a KEDA Kafka scaler for lag-based autoscaling. See [docs/cloud-run.md](docs/cloud-run.md).
+Repeat both deployments per region with region-local bootstrap servers, egress subnets, and secrets. Worker pools do not receive HTTP traffic. Scale them with min/max instances, or use CREMA or a KEDA Kafka scaler for lag-based autoscaling. See [docs/cloud-run.md](docs/cloud-run.md) and [docs/failover-routing.md](docs/failover-routing.md).
 
 ## Configuration
 
@@ -165,15 +179,22 @@ Worker pools do not receive HTTP traffic. Scale them with min/max instances, or 
 ## Production checklist
 
 - Use one Confluent cluster per region and always connect to the local cluster.
+- Terminate public traffic at Cloudflare; use Cloudflare WAF, DDoS protection, and Load Balancing.
+- Put a regional external ALB and serverless NEG in front of each regional Cloud Run service. Do not expose the Cloud Run default URL.
+- Restrict the regional ALBs to Cloudflare IP ranges, or use Authenticated Origin Pulls/mTLS.
+- Health-check `/readyz` from Cloudflare and make it include a bounded Kafka check.
+- Keep both regions warm and size each region for full peak load; do not use cold standby or scale-to-zero for the producer.
 - Use `sasl_ssl` with SASL/PLAIN and store credentials in Secret Manager.
-- Enable PSC Global Access only when Cloud Run must cross regions.
+- Keep PSC local in each region. Enable PSC Global Access only as a cross-region fallback.
 - Attach a Cloud Run startup probe; Direct VPC egress can delay the first packet.
 - Keep the consumer's `SIGTERM` budget below the Cloud Run termination grace period.
 - Commit offsets only after processing, and commit again during partition revoke.
 - Make consumers idempotent. Kafka gives at-least-once delivery with manual commits.
 - Align consumer concurrency with partition count; extra instances sit idle.
 - Use idempotent producers and do not produce to Cluster Linking mirror topics.
-- Monitor consumer lag, producer error rate, request latency, and PSC endpoint health.
+- Use Dedicated or Enterprise multi-zone clusters, bidirectional Cluster Linking, and offset/ACL sync for resilience-first deployments.
+- Monitor consumer lag, producer error rate, request latency, Cloudflare pool health, and PSC endpoint health.
+- Test Cloudflare origin failover, Kafka-only readiness failure, and direct origin bypass.
 
 ## Documentation
 
@@ -183,7 +204,7 @@ Worker pools do not receive HTTP traffic. Scale them with min/max instances, or 
 - [Subscribing](docs/subscribing.md)
 - [Cloud Run lifecycle and scaling](docs/cloud-run.md)
 - [Multi-region and failover](docs/multi-region.md)
-- [Regional failover and global routing](docs/failover-routing.md)
+- [Regional failover and Cloudflare edge routing](docs/failover-routing.md)
 - [Operations and security](docs/operations.md)
 
 ## License

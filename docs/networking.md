@@ -193,31 +193,38 @@ If you use Confluent Schema Registry over a separate PSC endpoint, allow TCP 443
 Deploy the service or worker pool with Direct VPC egress:
 
 ```bash
-gcloud run deploy producer-service \
+gcloud run deploy kafka-producer-api \
   --image us-central1-docker.pkg.dev/PROJECT_ID/REPO/kafka-app:latest \
   --region us-central1 \
   --network kafka-vpc \
   --subnet kafka-run-us-central1 \
   --vpc-egress private-ranges-only \
-  --startup-probe httpGet.path=/healthz,initialDelaySeconds=10,failureThreshold=30,periodSeconds=5,timeoutSeconds=3
+  --allow-unauthenticated \
+  --ingress internal-and-cloud-load-balancing \
+  --min-instances 2 \
+  --startup-probe httpGet.path=/healthz,initialDelaySeconds=10,failureThreshold=30,periodSeconds=5,timeoutSeconds=3 \
+  --readiness-probe httpGet.path=/readyz,httpGet.port=8080,successThreshold=2,failureThreshold=3,timeoutSeconds=2,periodSeconds=10
 ```
 
 For a worker pool:
 
 ```bash
-gcloud run worker-pools deploy consumer-worker \
+gcloud run worker-pools deploy kafka-consumer-worker \
   --image us-central1-docker.pkg.dev/PROJECT_ID/REPO/kafka-app:latest \
   --region us-central1 \
   --network kafka-vpc \
   --subnet kafka-run-us-central1 \
-  --vpc-egress private-ranges-only
+  --vpc-egress private-ranges-only \
+  --min-instances 2
 ```
+
+The producer is not exposed directly. See [Regional failover and Cloudflare edge routing](failover-routing.md) for the regional external ALB, serverless NEG, and Cloudflare Load Balancing layer. The service allows unauthenticated requests only because ingress is restricted to that ALB.
 
 Notes:
 
 - Direct VPC egress can delay the first outbound packet while the network is attached. Use a startup probe for services.
 - The Cloud Run egress subnet must be in the same region as the Cloud Run resource.
-- The PSC endpoint may be in the same region or, with Global Access, another region.
+- Keep Kafka traffic on the local PSC endpoint. PSC Global Access is a fallback while the endpoint region is healthy; it does not make a failed region available.
 - `private-ranges-only` routes private destinations to the VPC. If private DNS or cross-region routing does not work, test with `all-traffic` before changing the design.
 
 ## Step 7: Verify with the repository tooling
@@ -251,6 +258,8 @@ For each region, create a regional private zone and regional records. Keep the r
 | us-east1 | `pkc-yyyyy.us-east1.gcp.confluent.cloud:9092` | `us-east1.gcp.confluent.cloud.` |
 
 Do not point every region at one cluster unless that is an explicit design choice. The regional hostname should resolve to the regional cluster's PSC endpoints.
+
+The public HTTP producer hostname is separate and is routed by Cloudflare Load Balancing. Do not put Kafka bootstrap traffic behind Cloudflare or the HTTP load balancers. See [Regional failover and Cloudflare edge routing](failover-routing.md).
 
 If you use Shared VPC, attach the Cloud Run projects to the host project's network and create the private zones in the host project, or use Cloud DNS peering. Confirm that the Cloud Run service project can resolve the private zone.
 

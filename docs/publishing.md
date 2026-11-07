@@ -13,6 +13,8 @@ Design for at-least-once:
 
 ## Recommended producer configuration
 
+HTTP publishes enter through Cloudflare Load Balancing and a regional external ALB. A Cloud Run app that embeds the Kafka client bypasses that HTTP edge and writes through Direct VPC egress and PSC instead.
+
 The reference producer is in [`src/kafka.ts`](../src/kafka.ts) and is used by [`src/producer-service.ts`](../src/producer-service.ts).
 
 | Setting | Value | Why |

@@ -8,9 +8,21 @@
 | One cluster per region, active-passive | Local cluster in primary; linked standby | Medium | Regional failover with a clear primary |
 | One cluster per region, active-active | Local cluster in every region; bidirectional links | High | Regional writes must stay local; global aggregation is required |
 
-The recommended default is one cluster per region with Cluster Linking and an active-passive failover plan. Add active-active only when the business requirements justify the consistency and deduplication complexity.
+The resilience-first default is one cluster per region with Cluster Linking and both regions warm. Prefer active-active where the domain can handle multi-writer deduplication and fencing. Otherwise use warm active-passive with pre-created secondary resources; do not rely on cold standby.
 
-For the HTTP routing layer, concrete global load balancer names, and the Cloud Run service health pattern, see [Regional failover and global routing](failover-routing.md).
+For the HTTP routing layer, concrete Cloudflare and regional ALB names, and the Cloud Run readiness pattern, see [Regional failover and Cloudflare edge routing](failover-routing.md).
+
+## Resilience-first default
+
+- Run at least two active regions. For tier-0, add a third region.
+- Size each region for full peak load, not a fraction of peak. Keep N+1 capacity at minimum.
+- Use Confluent Dedicated or Enterprise multi-zone clusters. Confirm the current SLA for your cluster type; multi-zone Dedicated is 99.99%, while Basic is 99.5%.
+- Use bidirectional Cluster Linking for active-active, or source-to-secondary linking plus a reverse link for failback in active-passive.
+- Enable consumer offset and ACL synchronization where supported, and verify it in a game day.
+- Keep Cloud Run minimum instances at 2 or more in each active region. Do not scale the producer to zero.
+- Keep PSC local in every region across all three zones. Use PSC Global Access only as a cross-region fallback.
+- Put both regional origins in Cloudflare Load Balancing and keep both pools healthy. Do not use DNS-only failover.
+- Test the Cloudflare edge dependency. For tier-0, document a break-glass path that does not depend on the same Cloudflare load balancer.
 
 ## Cluster Linking
 
@@ -57,10 +69,11 @@ Bidirectional links with the same topic names can create replication loops unles
 2. Check the Cluster Linking lag. Record the last replicated offset for each topic. This is the RPO.
 3. Promote the mirror topics in the secondary cluster.
 4. Switch the application configuration to the secondary bootstrap endpoint. This can be an environment variable, a secret version, a ConfigMap, or a redeploy.
-5. Restart or redeploy producers and consumers. Kafka clients cache metadata and existing connections; a DNS change alone does not move them immediately.
-6. Validate consumer startup position. If consumer offsets were not synchronized, choose a rewind policy or replay from a timestamp.
-7. Monitor duplicates, lag, and error rates.
-8. Keep the old primary isolated until it is safe to rebuild.
+5. Confirm Cloudflare has moved HTTP traffic to the secondary origin pool. If it has not, disable the primary pool manually.
+6. Restart or redeploy producers and consumers. Kafka clients cache metadata and existing connections; a DNS change alone does not move them immediately.
+7. Validate consumer startup position. If consumer offsets were not synchronized, choose a rewind policy or replay from a timestamp.
+8. Monitor duplicates, lag, and error rates.
+9. Keep the old primary isolated until it is safe to rebuild.
 
 ### Failback
 
@@ -110,10 +123,13 @@ Active-active does not remove the need for fencing during a partition. If both r
 - Use the real Confluent bootstrap hostname for each region.
 - Override DNS privately to the regional PSC endpoints.
 - Keep regional hostnames separate. Do not point both regions at the same cluster unless that is the design.
+- Keep the Kafka DNS path separate from the public HTTP path. `producer.example.com` is a Cloudflare HTTP hostname; it is not a Kafka bootstrap endpoint.
 - Kafka clients resolve bootstrap and broker hostnames, cache metadata, and keep long-lived connections. A DNS change does not immediately move an existing producer or consumer.
 - For failover, update the application configuration and restart or redeploy the clients. DNS-based failover can reduce the config change, but it still needs client reconnection and testing.
 
-If you use a global DNS name with health-checked failover, verify:
+Cloudflare Load Balancing handles HTTP origins only. There is no Cloudflare Kafka proxy in this design. Do not put Kafka bootstrap traffic behind Cloudflare Load Balancing.
+
+If you use a global DNS name with health-checked failover for a non-Kafka endpoint, verify:
 
 - The TTL is low enough for your RTO.
 - The client re-resolves after a connection failure.
@@ -135,10 +151,10 @@ Reduce RPO with:
 
 Reduce RTO with:
 
-- Runbooks and automation for promotion and client restart.
-- Pre-created secondary resources and secrets.
+- Runbooks and automation for promotion, Cloudflare pool failover, and client restart.
+- Pre-created secondary resources, secrets, Cloudflare origin pools, and regional ALBs.
 - Regular game days.
-- Warm consumers and producers in the secondary where practical.
+- Warm consumers and producers in the secondary. Keep both Cloudflare origin pools healthy.
 
 ## Consumer offsets on failover
 
@@ -153,8 +169,11 @@ A consumer that starts at `latest` after failover may skip events. A consumer th
 
 ## Security and networking parity
 
-- Create the same PSC, DNS, firewall, and Cloud Run configuration in every region.
-- Enable PSC Global Access only where cross-region access is required.
+- Create the same PSC, DNS, firewall, Cloudflare, and Cloud Run configuration in every region.
+- Create one Cloudflare origin pool and one regional external ALB per active region.
+- Restrict regional ALB origins to Cloudflare IP ranges or Authenticated Origin Pulls. Do not expose the Cloud Run default URL.
+- Keep the same WAF and DDoS policy on the public hostname in every region.
+- Enable PSC Global Access only where cross-region access is required; do not use it as the primary failover mechanism.
 - Use separate API keys per region and environment.
 - Keep secrets replicated to the regions that need them.
 - Ensure the Schema Registry endpoint is reachable from each region.
@@ -162,16 +181,19 @@ A consumer that starts at `latest` after failover may skip events. A consumer th
 
 ## Testing
 
-Run a failover game day:
+Run an edge and Kafka failover game day:
 
 1. Produce a known stream with sequence numbers.
 2. Measure link lag under load.
-3. Simulate a regional failure.
-4. Execute the runbook with a timer.
-5. Measure actual RPO and RTO.
-6. Verify duplicates, ordering, and consumer position.
-7. Fail back.
-8. Record gaps and fix the runbook.
+3. Disable the primary Cloudflare origin pool and verify HTTP traffic moves to the secondary ALB.
+4. Simulate a Kafka-only failure in the primary region and verify `/readyz` fails and Cloudflare moves traffic.
+5. Call a regional ALB IP directly from outside Cloudflare and verify the origin blocks it.
+6. Simulate a full regional failure.
+7. Execute the runbook with a timer.
+8. Measure actual RPO and RTO.
+9. Verify duplicates, ordering, and consumer position.
+10. Fail back.
+11. Record gaps and fix the runbook.
 
 Test during peak load, not only in a quiet environment.
 
@@ -185,9 +207,16 @@ Test during peak load, not only in a quiet environment.
 - Building an active-active topology without a conflict resolution rule.
 - Forgetting Schema Registry in the failover plan.
 - Testing failover only in one direction.
+- Using cold standby or scale-to-zero for the producer when you need automatic failover.
+- Using `/healthz` or a process-only `/readyz` as the Cloudflare health check.
+- Putting Kafka bootstrap traffic behind Cloudflare or an HTTP load balancer.
+- Leaving regional ALB IPs reachable from the public internet without Cloudflare origin protection.
+- Assuming Cloudflare Load Balancing promotes topics or moves consumer offsets.
 
 ## References
 
+- [Cloudflare Load Balancing](https://developers.cloudflare.com/load-balancing/)
+- [Regional external Application Load Balancer with Cloud Run](https://docs.cloud.google.com/load-balancing/docs/https/setting-up-reg-ext-https-serverless)
 - [Confluent Cloud Cluster Linking](https://docs.confluent.io/cloud/current/clusters/cluster-linking/index.html)
 - [Confluent multi-region clusters](https://docs.confluent.io/cloud/current/multi-zone/multiregion-cluster.html)
 - [Cloud DNS private zones](https://cloud.google.com/dns/docs/zones)

@@ -12,7 +12,8 @@ Define SLIs around user-visible behavior, not only process health.
 | Consumer freshness | Time from event creation to successful processing |
 | Consumer lag | Records behind the high watermark per partition |
 | Processing error rate | Handler failures divided by records processed |
-| Failover readiness | Cluster Linking lag and last successful promotion test |
+| Edge routing availability | Healthy Cloudflare origin pools and successful origin health checks |
+| Failover readiness | Cluster Linking lag, Cloudflare pool health, and last successful promotion test |
 
 ## Alerts
 
@@ -20,6 +21,8 @@ Alert on symptoms first:
 
 - Producer 5xx rate above a small threshold for five minutes.
 - Producer p99 latency above the budget.
+- Cloudflare origin pool unhealthy or health checks failing.
+- Cloudflare or regional ALB 5xx rate above a small threshold.
 - Consumer lag growing for fifteen minutes and not recovering.
 - No consumer progress for a topic that should be active.
 - Cluster Linking lag above the RPO target.
@@ -71,7 +74,12 @@ Log correlation IDs at the HTTP boundary and propagate them through Kafka header
 
 - Keep Kafka traffic private through PSC.
 - Restrict egress with firewall rules.
-- Use internal ingress or IAM for the producer API when it is not meant to be public.
+- Terminate public HTTP traffic at Cloudflare with WAF, DDoS protection, and Load Balancing.
+- Put a regional external ALB and serverless NEG in front of each regional Cloud Run producer service.
+- Use Cloud Run ingress `internal-and-cloud-load-balancing`; do not expose the default Cloud Run URL.
+- If the origin allows unauthenticated requests, that is only acceptable because ingress is restricted to the ALB. Enforce end-user authentication at Cloudflare or an identity-aware proxy if needed.
+- Restrict the regional ALBs to Cloudflare IP ranges or Authenticated Origin Pulls. If you use Cloud Armor, use it only as an origin allowlist; Cloudflare is the primary WAF.
+- Do not put Kafka bootstrap traffic behind Cloudflare or the HTTP load balancers.
 - Consider VPC Service Controls for data exfiltration controls.
 - Do not disable TLS verification.
 
@@ -104,8 +112,10 @@ Create topics through the provisioning script or infrastructure as code, not wit
 - Account for Cluster Linking replication traffic.
 - Size partitions for the target consumer parallelism.
 - Size Cloud Run egress subnets for the maximum instance count.
+- Size the regional proxy-only subnets for normal plus failover traffic.
 - Check PSC endpoint throughput limits.
-- Leave headroom for failover, replay, and schema migrations.
+- Check Cloudflare Load Balancing pool and health-check limits.
+- Keep at least N+1 capacity in each active region and leave headroom for failover, replay, and schema migrations.
 - Load test with realistic keys and partition distribution.
 
 ## Testing
@@ -116,6 +126,9 @@ Create topics through the provisioning script or infrastructure as code, not wit
 - Test poison-message handling and DLQ routing.
 - Test graceful shutdown under load.
 - Test PSC connectivity from a Cloud Run job in each region.
+- Test Cloudflare origin pool failover and failback.
+- Test Kafka-only failure and confirm `/readyz` turns unhealthy.
+- Test direct access to the regional ALB from outside Cloudflare and confirm it is blocked.
 - Run a multi-region failover game day.
 - Test credential rotation.
 
@@ -123,12 +136,31 @@ Create topics through the provisioning script or infrastructure as code, not wit
 
 ### Producer cannot publish
 
-1. Check the Cloud Run 5xx rate and logs.
-2. Check DNS resolution of the bootstrap and broker hostnames.
-3. Check PSC forwarding rule state and firewall rules.
-4. Check Confluent API key validity and topic ACLs.
-5. Check producer queue depth and delivery timeouts.
-6. If the region is unhealthy, follow the failover runbook.
+1. Check Cloudflare Load Balancing pool health and origin health-check status.
+2. Check the regional ALB 5xx rate and Cloud Run 5xx rate and logs.
+3. Check DNS resolution of the bootstrap and broker hostnames.
+4. Check PSC forwarding rule state and firewall rules.
+5. Check Confluent API key validity and topic ACLs.
+6. Check producer queue depth and delivery timeouts.
+7. If the region is unhealthy, follow the failover runbook.
+
+### Kafka-only failure
+
+1. Confirm whether `/readyz` on the primary origin is failing.
+2. If `/readyz` remains healthy, the readiness check is not Kafka-aware. Disable the primary Cloudflare pool manually and fix the probe.
+3. If `/readyz` fails, confirm Cloudflare moves HTTP traffic to the secondary pool.
+4. Promote the secondary mirror topics and switch Kafka clients to the secondary bootstrap endpoint.
+5. Do not assume Cloudflare failover moved Kafka clients or promoted topics.
+
+### Cloudflare edge or origin failure
+
+1. Check the Cloudflare Load Balancer status and each origin pool.
+2. Check the health-check path (`/readyz`), expected status, Host header, and WAF exemptions.
+3. Check the regional ALB forwarding rule, HTTPS proxy, certificate, serverless NEG, and Cloud Run service.
+4. Confirm the origin is not blocked by Cloudflare IP allowlisting or Authenticated Origin Pulls.
+5. If one origin is unhealthy, confirm traffic is served by the other pool.
+6. If Cloudflare itself is degraded, follow the documented break-glass path.
+7. Do not change Kafka bootstrap settings in response to an HTTP edge failure unless the Kafka region is also failed.
 
 ### Consumer lag is growing
 
@@ -166,13 +198,14 @@ Create topics through the provisioning script or infrastructure as code, not wit
 
 ## Cost control
 
-- Right-size `min-instances`; warm instances are convenient but not free.
+- Set `min-instances` from the availability target, not just cost. Resilience-first uses at least two warm instances per active region.
 - Use instance-based billing only where background work requires it.
+- Keep both regions warm when you need automatic failover. Remove warm capacity only with explicit risk acceptance.
 - Avoid cross-region Kafka traffic in steady state.
 - Compress events.
 - Scale consumers to partition count, not beyond.
 - Set retention based on replay needs, not indefinitely.
-- Review idle clusters, topics, and PSC endpoints.
+- Review idle clusters, topics, PSC endpoints, proxy-only subnets, and unused Cloudflare origin pools.
 
 ## Change management
 
@@ -182,6 +215,9 @@ Changes that need a game day or a rollback plan:
 - Partition count changes.
 - Schema compatibility changes.
 - Cluster Linking topology changes.
+- Cloudflare Load Balancing pool, steering, health-check, or WAF changes.
+- Regional external ALB, serverless NEG, certificate, or proxy-only subnet changes.
+- Cloud Run ingress or readiness-probe changes.
 - DNS or PSC changes.
 - Producer or consumer upgrade to a new client version.
 - Changes to commit strategy or batch size.
