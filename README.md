@@ -80,6 +80,7 @@ cp .env.example .env
 # Edit .env with your Confluent bootstrap server, API key, and secret.
 
 npm ci
+npm run lint
 npm run build
 
 npm run create-topics

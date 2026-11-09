@@ -1,4 +1,4 @@
-import { errorDetails, type AppLogger } from "./logger";
+import {errorDetails, type AppLogger} from './logger';
 
 export type ShutdownHandler = () => Promise<void>;
 
@@ -11,15 +11,21 @@ export function installSignalHandlers(
 
   const run = async (signal: NodeJS.Signals): Promise<void> => {
     if (shuttingDown) {
-      logger.warn("Shutdown already in progress", { signal });
+      logger.warn('Shutdown already in progress', {signal});
       return;
     }
 
     shuttingDown = true;
-    logger.info("Received signal; starting graceful shutdown", { signal, timeoutMs });
+    logger.info('Received signal; starting graceful shutdown', {
+      signal,
+      timeoutMs,
+    });
 
     const forceExit = setTimeout(() => {
-      logger.error("Graceful shutdown timed out; forcing exit", { signal, timeoutMs });
+      logger.error('Graceful shutdown timed out; forcing exit', {
+        signal,
+        timeoutMs,
+      });
       process.exit(1);
     }, timeoutMs);
     forceExit.unref();
@@ -27,15 +33,15 @@ export function installSignalHandlers(
     try {
       await shutdown();
       clearTimeout(forceExit);
-      logger.info("Graceful shutdown complete", { signal });
+      logger.info('Graceful shutdown complete', {signal});
       process.exit(0);
     } catch (error) {
       clearTimeout(forceExit);
-      logger.error("Graceful shutdown failed", errorDetails(error));
+      logger.error('Graceful shutdown failed', errorDetails(error));
       process.exit(1);
     }
   };
 
-  process.on("SIGTERM", () => void run("SIGTERM"));
-  process.on("SIGINT", () => void run("SIGINT"));
+  process.on('SIGTERM', () => void run('SIGTERM'));
+  process.on('SIGINT', () => void run('SIGINT'));
 }

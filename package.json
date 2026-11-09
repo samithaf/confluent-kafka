@@ -11,6 +11,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "gts lint",
+    "fix": "gts fix",
     "start:producer": "node dist/producer-service.js",
     "start:consumer": "node dist/consumer-worker.js",
     "dev:producer": "tsx src/producer-service.ts",
@@ -20,10 +22,13 @@
   },
   "dependencies": {
     "@confluentinc/kafka-javascript": "^1.11.0",
-    "dotenv": "^16.6.1"
+    "dotenv": "^16.6.1",
+    "lodash": "^4.18.1"
   },
   "devDependencies": {
+    "@types/lodash": "^4.17.27",
     "@types/node": "^22.10.2",
+    "gts": "^7.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }
